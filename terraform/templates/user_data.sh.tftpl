@@ -1,0 +1,83 @@
+#!/bin/bash
+set -euo pipefail
+umask 027
+# No credentials are embedded in user data. The instance role resolves secret ARNs.
+# AL2023 supplies curl-minimal; installing full curl alongside it conflicts.
+command -v curl >/dev/null || dnf install -y curl-minimal
+dnf install -y unzip tar xz python3 awscli2 amazon-cloudwatch-agent logrotate
+install -d -m 0755 /opt/erp /var/log/erp /etc/erp
+curl --fail --silent --show-error --location https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o /etc/erp/rds-ca.pem
+chmod 0644 /etc/erp/rds-ca.pem
+id erp >/dev/null 2>&1 || useradd --system --home-dir /opt/erp --shell /sbin/nologin erp
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cd "$work"
+curl --fail --silent --show-error --location "https://nodejs.org/dist/v${node_version}/node-v${node_version}-linux-x64.tar.xz" -o node.tar.xz
+curl --fail --silent --show-error --location "https://nodejs.org/dist/v${node_version}/SHASUMS256.txt" -o SHASUMS256.txt
+awk '$2 == "node-v${node_version}-linux-x64.tar.xz" {print $1 "  node.tar.xz"}' SHASUMS256.txt > node.sha256
+test -s node.sha256
+sha256sum -c node.sha256
+tar -xJf node.tar.xz -C /usr/local --strip-components=1
+aws s3 cp "s3://${release_bucket}/${release_key}" backend.zip --region ${region} --only-show-errors
+printf '%s  backend.zip\n' '${release_sha256}' | sha256sum -c -
+unzip -q backend.zip -d /opt/erp
+cd /opt/erp
+test -f package-lock.json
+npm ci --omit=dev --no-audit --no-fund
+chown -R root:erp /opt/erp
+chmod -R g+rX,o-rwx /opt/erp
+python3 - <<'PY'
+import base64,json
+config=json.loads(base64.b64decode('${environment_json_b64}'))
+with open('/etc/erp.env','w') as f:
+    for key,value in config.items():
+        f.write(key+'='+json.dumps(value)+'\n')
+PY
+chmod 0600 /etc/erp.env
+touch /var/log/erp/app.log
+chown erp:erp /var/log/erp/app.log
+cat >/etc/systemd/system/erp.service <<'UNIT'
+[Unit]
+Description=Enterprise ERP API
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=erp
+Group=erp
+WorkingDirectory=/opt/erp
+EnvironmentFile=/etc/erp.env
+ExecStart=/usr/local/bin/node server.js
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/erp
+RestrictSUIDSGID=true
+UMask=0027
+StandardOutput=append:/var/log/erp/app.log
+StandardError=append:/var/log/erp/app.log
+[Install]
+WantedBy=multi-user.target
+UNIT
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+{"logs":{"logs_collected":{"files":{"collect_list":[{"file_path":"/var/log/erp/app.log","log_group_name":"${log_group}","log_stream_name":"{instance_id}"}]}}}}
+JSON
+cat >/etc/logrotate.d/erp <<'ROTATE'
+/var/log/erp/app.log {
+  daily
+  rotate 7
+  size 50M
+  compress
+  copytruncate
+  missingok
+  notifempty
+}
+ROTATE
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+systemctl daemon-reload
+systemctl enable --now erp

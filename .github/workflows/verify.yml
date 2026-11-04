@@ -1,0 +1,120 @@
+name: Verify ERP
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            tooling/package-lock.json
+      - run: npm ci --prefix backend
+      - run: npm ci --prefix tooling
+      - run: npm --prefix backend test
+      - run: npm --prefix tooling run build
+      - name: Install browser
+        run: npx --prefix tooling playwright-core install --with-deps chromium
+      - name: Browser contract smoke tests
+        run: node scripts/frontend-smoke.mjs
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.5
+      - run: terraform -chdir=terraform fmt -check -recursive
+      - run: terraform -chdir=terraform init -backend=false -input=false -lockfile=readonly
+      - run: terraform -chdir=terraform validate
+      - run: terraform -chdir=terraform test
+  sql-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --prefix backend
+      - name: Prepare isolated SQL test credentials
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, secrets
+          directory = pathlib.Path(os.environ['RUNNER_TEMP']) / 'erp-test'
+          directory.mkdir(mode=0o700)
+          password = secrets.token_urlsafe(36) + '!aA9'
+          environment = directory / 'sql.env'
+          environment.write_text('ACCEPT_EULA=Y\nMSSQL_PID=Developer\nMSSQL_SA_PASSWORD=' + password + '\n')
+          connection = directory / 'connection.json'
+          connection.write_text(json.dumps({'host':'127.0.0.1','port':14339,'username':'sa','password':password}))
+          environment.chmod(0o600)
+          connection.chmod(0o600)
+          PY
+      - name: Start SQL Server Developer Edition
+        shell: bash
+        run: |
+          docker run --detach --name erp-sql --memory=4g \
+            --env-file "$RUNNER_TEMP/erp-test/sql.env" \
+            -p 127.0.0.1:14339:1433 \
+            mcr.microsoft.com/mssql/server:2022-CU22-ubuntu-22.04
+      - name: Wait for SQL readiness and execute database tests
+        working-directory: backend
+        shell: bash
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+          const sql = require('mssql');
+          const raw = fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'erp-test/connection.json'), 'utf8');
+          const input = JSON.parse(raw);
+          async function main() {
+            let ready = false;
+            for (let attempt = 0; attempt < 45; attempt++) {
+              let pool;
+              try {
+                pool = await new sql.ConnectionPool({
+                  server: input.host, port: input.port, user: input.username, password: input.password,
+                  database: 'master', connectionTimeout: 2000, requestTimeout: 2000,
+                  options: { encrypt: true, trustServerCertificate: true }
+                }).connect();
+                await pool.request().query('SELECT 1 AS ready');
+                ready = true;
+                break;
+              } catch {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+              } finally {
+                if (pool) await pool.close();
+              }
+            }
+            if (!ready) throw new Error('Isolated SQL Server did not become ready');
+            const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap', 'test/database.integration.js'], {
+              stdio: 'inherit',
+              env: { ...process.env, NODE_ENV: 'test', DB_TRUST_CERT: 'true', TEST_DB_CONFIG_JSON: raw }
+            });
+            if (result.error) throw result.error;
+            process.exitCode = result.status ?? 1;
+          }
+          main().catch(error => { console.error(error.message); process.exitCode = 1; });
+          JS
+      - name: Remove isolated SQL resources
+        if: always()
+        shell: bash
+        run: |
+          docker rm --force erp-sql || true
+          rm -f "$RUNNER_TEMP/erp-test/sql.env" "$RUNNER_TEMP/erp-test/connection.json"
+          rmdir "$RUNNER_TEMP/erp-test" 2>/dev/null || true

@@ -1,0 +1,14 @@
+node_modules/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+.env
+.env.*
+!.env.example
+dist/
+coverage/
+*.log
+frontend/vendor/

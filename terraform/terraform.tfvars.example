@@ -1,0 +1,15 @@
+aws_region              = "ca-central-1"
+project_name            = "erp"
+environment             = "production"
+origin_domain_name      = "origin.erp.example.com"
+origin_certificate_arn  = "arn:aws:acm:ca-central-1:123456789012:certificate/replace-with-issued-certificate"
+origin_route53_zone_id  = "Z_REPLACE_WITH_YOUR_PUBLIC_ZONE"
+app_secret_arn          = "arn:aws:secretsmanager:ca-central-1:123456789012:secret:erp-app-REPLACE"
+bootstrap_admin_email   = "erp-admin@example.com"
+alarm_email             = "operations@example.com"
+desired_capacity        = 0 # First apply: create buckets, DB and infrastructure. Then upload a release and set 2.
+backend_release_key     = "releases/COMMIT_SHA/backend.zip"
+backend_release_sha256  = "0000000000000000000000000000000000000000000000000000000000000000"
+deletion_protection     = true
+bootstrap_database      = false
+# runtime_db_secret_arn  = "arn:aws:secretsmanager:ca-central-1:123456789012:secret:erp-runtime-REPLACE"
